@@ -1,0 +1,448 @@
+library(dplyr)
+library(tidytext)
+library(lubridate)
+library(syuzhet)
+library(tm)
+library(ggplot2)
+library(scales)
+library(readxl)
+library(dplyr)
+library(ggrepel)
+library(caTools)
+
+# Library for SQLite database 
+library(RSQLite)
+library(DBI)
+
+# Connection between R and database
+con <- dbConnect(RSQLite::SQLite(), "/Users/yashdivaker/Desktop/Project/tcs.db")
+
+# List all tables in the database
+tables <- dbListTables(con)
+print(tables)
+
+####################################################### tech_mahindra Anslysis Starts ####################################################
+####################################################### Code for Sentiment Analysis and its plot Starts ##################################
+# data driven from database table to r studio
+data <- dbGetQuery(con, "SELECT Date,News_heading,News_description,new_source FROM tech_mahindra")
+
+# Date Conversion to standard format
+data <- data %>%
+  mutate(Date = dmy(Date))
+
+# Data Conversion for 2 week analysis
+data <- data %>%
+  mutate(Two_Week = floor_date(Date, unit = "week") + (week(Date) %% 2) * 7)
+
+# Aggregating News_heading and News_Description for sentiment and TF-IDF analysis
+data <- data %>%
+  mutate(text = paste(News_heading, News_description, sep = ". "))
+
+
+# Tokenization of text, removing stop words, and computing TF-IDF for each 2-week period
+tokenized_data <- data %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words) %>%
+  count(Two_Week, word, sort = TRUE) %>%
+  bind_tf_idf(word, Two_Week, n) %>%
+  arrange(Two_Week, desc(tf_idf))
+
+# Applying sentiment analysis for each row 
+data$sentiment_score <- get_sentiment(data$text, method = "syuzhet")
+
+# Classify sentiment as Positive, Negative, or Neutral for each row
+data <- data %>%
+  mutate(sentiment_category = case_when(
+    sentiment_score > 0 ~ "Positive",
+    sentiment_score < 0 ~ "Negative",
+    sentiment_score == 0 ~ "Neutral"
+  ))
+
+# Summarizing sentiment for each 2-week period (bi-weekly sentiment analysis with percentages)
+biweekly_sentiment <- data %>%
+  group_by(Two_Week) %>%
+  summarize(
+    total_rows = n(),  # Total rows for the 2-week period
+    positive = sum(sentiment_category == "Positive"),
+    negative = sum(sentiment_category == "Negative"),
+    neutral = sum(sentiment_category == "Neutral"),
+    avg_sentiment_score = mean(sentiment_score),  # Average sentiment score for the 2-week period
+    total_sentiment_score = sum(sentiment_score),  # Total sentiment score for the 2-week period
+    # Calculate percentages for each sentiment
+    positive_percentage = (positive / total_rows) * 100,
+    negative_percentage = (negative / total_rows) * 100,
+    neutral_percentage = (neutral / total_rows) * 100
+  )
+
+# Summarizing TF-IDF for each 2-week period
+biweekly_tfidf <- tokenized_data %>%
+  group_by(Two_Week) %>%
+  summarize(
+    top_words = paste(word[1:10], collapse = ", ")  # top 10 words based on TF-IDF for each 2-week period
+  )
+
+# Identifying the best news source for each 2-week period based on average sentiment score
+best_news_source <- data %>%
+  group_by(Two_Week, new_source) %>%
+  summarize(
+    source_avg_sentiment = mean(sentiment_score)  
+  ) %>%
+  arrange(Two_Week, desc(source_avg_sentiment)) %>%
+  slice(1)  
+
+# Combination of bi-weekly sentiment, TF-IDF results, and best news source for reporting
+biweekly_analysis <- biweekly_sentiment %>%
+  left_join(biweekly_tfidf, by = "Two_Week") %>%
+  left_join(best_news_source, by = "Two_Week")
+
+# Final bi-weekly analysis
+print(biweekly_analysis)
+
+
+# Reshaping the data to long format for ggplot
+biweekly_sentiment_long <- biweekly_analysis %>%
+  select(Two_Week, positive_percentage, negative_percentage, neutral_percentage) %>%
+  pivot_longer(cols = c(positive_percentage, negative_percentage, neutral_percentage),
+               names_to = "Sentiment",
+               values_to = "Percentage") %>%
+  mutate(Sentiment = case_when(
+    Sentiment == "positive_percentage" ~ "Positive",
+    Sentiment == "negative_percentage" ~ "Negative",
+    Sentiment == "neutral_percentage" ~ "Neutral"
+  ))
+
+# ggplot with percentage labels
+ggplot(biweekly_sentiment_long, aes(x = Two_Week, y = Percentage, color = Sentiment, group = Sentiment)) +
+  geom_line(size = 1.2) +                             
+  geom_point(size = 2, color = "black") +             
+  geom_text(aes(label = round(Percentage, 1)),        
+            vjust = -0.5, size = 3, color = "black") +
+  scale_color_manual(values = c("Positive" = "green", 
+  scale_x_date(date_labels = "%d %b %Y",              
+               date_breaks = "1 week") +              
+  labs(title = "Biweekly Sentiment Analysis",
+       x = "Week",
+       y = "Sentiment Percentage (%)",
+       color = "Sentiment") +                         
+  theme_minimal() +                                   
+  theme(
+    plot.background = element_rect(fill = "grey95", color = NA),  
+    panel.background = element_rect(fill = "white", color = NA),  
+    panel.grid.major = element_line(color = "grey80"),            
+    panel.grid.minor = element_line(color = "grey90"),            
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black", size = 10),  
+    axis.text.y = element_text(color = "black", size = 10),       
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14, color = "darkblue"),  
+    legend.background = element_rect(fill = "grey90", color = "grey70"),  
+    legend.key = element_rect(fill = "grey95"),                   
+    legend.position = "top")
+####################################################### Code for Sentiment Analysis and its plot Ends #################################
+
+####################################################### Historical data analysis and its plot Starts ##################################
+# Historical data 
+stock_data <- read_xlsx("/Users/yashdivaker/Desktop/Project/tech_mahindra_price.xlsx")
+
+# Date Standarization 
+stock_data <- stock_data %>%
+  mutate(Date = as.Date(Date, format = "%b %d, %Y"))
+
+# Bi-weekly changes
+stock_data <- stock_data %>%
+  mutate(Two_Week = floor_date(Date, unit = "week") + (week(Date) %% 2) * 7)  # Adjust to create 2-week periods
+
+# Calculation for 2-week-wise average for all numerical columns
+biweekly_avg_data <- stock_data %>%
+  group_by(Two_Week) %>%
+  summarise(
+    Open_avg = mean(Open, na.rm = TRUE),
+    High_avg = mean(High, na.rm = TRUE),
+    Low_avg = mean(Low, na.rm = TRUE),
+    Close_avg = mean(Close, na.rm = TRUE)
+  )
+
+# 2-week-wise average data
+print(biweekly_avg_data)
+
+# ggplot for 2-week-wise clarity
+ggplot(biweekly_avg_data, aes(x = Two_Week, y = Open_avg)) +
+  geom_line(color = "steelblue", size = 1.5) +    
+  geom_point(size = 3, color = "darkorange", shape = 21, fill = "white", stroke = 1.2) +  
+  labs(title = "Biweekly Average of Open Price",  
+       x = "2-Week Period",                      
+       y = "Average Open Price (Rs)") +         
+  scale_x_date(date_labels = "%b %d, %Y", date_breaks = "2 weeks") +  
+  theme_minimal(base_size = 14) +                 
+  theme(
+    plot.background = element_rect(fill = "grey98", color = NA),  
+    panel.grid.major = element_line(color = "grey85"),            
+    panel.grid.minor = element_blank(),                           
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black", size = 10),  
+    axis.text.y = element_text(color = "black", size = 10),       
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, color = "darkblue"),  
+    plot.subtitle = element_text(hjust = 0.5, size = 12, color = "darkgrey"),  
+    axis.title.x = element_text(margin = margin(t = 10)),         
+    axis.title.y = element_text(margin = margin(r = 10)),         
+    panel.background = element_rect(fill = "white", color = NA))
+####################################################### Historical data analysis and its plot Ends ################################
+####################################################### tech_mahindra Analysis Ends ###############################################
+
+####################################################### Infosys Analysis Starts ###################################################
+####################################################### Code for Sentiment Analysis and its plot Starts ###########################
+# data driven from database table to r studio
+data_infosys <- dbGetQuery(con, "SELECT Date,News_heading,News_description,new_source FROM infosys")
+
+# Date Conversion to standard format
+data_infosys <- data_infosys %>%
+  mutate(Date = dmy(Date))
+
+# Data Conversion for 2 week analysis
+data_infosys <- data_infosys %>%
+  mutate(Two_Week = floor_date(Date, unit = "week") + (week(Date) %% 2) * 7)
+
+# Aggregating News_heading and News_Description for sentiment and TF-IDF analysis
+data_infosys <- data_infosys %>%
+  mutate(text = paste(News_heading, News_description, sep = ". "))
+
+# Tokenization of text, removing stop words, and computing TF-IDF for each 2-week period
+tokenized_data <- data_infosys %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words) %>%
+  count(Two_Week, word, sort = TRUE) %>%
+  bind_tf_idf(word, Two_Week, n) %>%
+  arrange(Two_Week, desc(tf_idf))
+
+# Applying sentiment analysis for each row 
+data_infosys$sentiment_score <- get_sentiment(data_infosys$text, method = "syuzhet")
+
+# Classify sentiment as Positive, Negative, or Neutral for each row
+data_infosys <- data_infosys %>%
+  mutate(sentiment_category = case_when(
+    sentiment_score > 0 ~ "Positive",
+    sentiment_score < 0 ~ "Negative",
+    sentiment_score == 0 ~ "Neutral"
+  ))
+
+# Summarizing sentiment for each 2-week period (bi-weekly sentiment analysis with percentages)
+biweekly_sentiment <- data_infosys %>%
+  group_by(Two_Week) %>%
+  summarize(
+    total_rows = n(),  # Total rows for the 2-week period
+    positive = sum(sentiment_category == "Positive"),
+    negative = sum(sentiment_category == "Negative"),
+    neutral = sum(sentiment_category == "Neutral"),
+    avg_sentiment_score = mean(sentiment_score),  # Average sentiment score for the 2-week period
+    total_sentiment_score = sum(sentiment_score),  # Total sentiment score for the 2-week period
+    # Calculate percentages for each sentiment
+    positive_percentage = (positive / total_rows) * 100,
+    negative_percentage = (negative / total_rows) * 100,
+    neutral_percentage = (neutral / total_rows) * 100
+  )
+
+# Summarizing TF-IDF for each 2-week period
+biweekly_tfidf <- tokenized_data %>%
+  group_by(Two_Week) %>%
+  summarize(
+    top_words = paste(word[1:10], collapse = ", ")  #top 10 words based on TF-IDF for each 2-week period
+  )
+
+# Identifying the best news source for each 2-week period based on average sentiment score
+best_news_source <- data_infosys %>%
+  group_by(Two_Week, new_source) %>%
+  summarize(
+    source_avg_sentiment = mean(sentiment_score)  
+  ) %>%
+  arrange(Two_Week, desc(source_avg_sentiment)) %>%
+  slice(1)
+
+# Combination of bi-weekly sentiment, TF-IDF results, and best news source for reporting
+biweekly_analysis <- biweekly_sentiment %>%
+  left_join(biweekly_tfidf, by = "Two_Week") %>%
+  left_join(best_news_source, by = "Two_Week")
+
+# Final bi-weekly analysis
+print(biweekly_analysis)
+
+# Reshaping the data to long format for ggplot
+biweekly_sentiment_long <- biweekly_analysis %>%
+  select(Two_Week, positive_percentage, negative_percentage, neutral_percentage) %>%
+  pivot_longer(cols = c(positive_percentage, negative_percentage, neutral_percentage),
+               names_to = "Sentiment",
+               values_to = "Percentage") %>%
+  mutate(Sentiment = case_when(
+    Sentiment == "positive_percentage" ~ "Positive",
+    Sentiment == "negative_percentage" ~ "Negative",
+    Sentiment == "neutral_percentage" ~ "Neutral"
+  ))
+
+# ggplot with percentage labels
+ggplot(biweekly_sentiment_long, aes(x = Two_Week, y = Percentage, color = Sentiment, group = Sentiment)) +
+  geom_line(size = 1.2) +                             
+  geom_point(size = 2, color = "black") +             
+  geom_text(aes(label = round(Percentage, 1)),        
+            vjust = -0.5, size = 3, color = "black") +
+  scale_color_manual(values = c("Positive" = "green", "Negative" = "red", "Neutral" = "blue")) +  
+  scale_x_date(date_labels = "%d %b %Y",              
+               date_breaks = "1 week") +              
+  labs(title = "Biweekly Sentiment Analysis",
+       x = "Week",
+       y = "Sentiment Percentage (%)",
+       color = "Sentiment") +                         
+  theme_minimal() +                                   # Clean base theme
+  theme(
+    plot.background = element_rect(fill = "grey95", color = NA),  
+    panel.background = element_rect(fill = "white", color = NA),  
+    panel.grid.major = element_line(color = "grey80"),            
+    panel.grid.minor = element_line(color = "grey90"),            
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black", size = 10),  
+    axis.text.y = element_text(color = "black", size = 10),       
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14, color = "darkblue"),  
+    legend.background = element_rect(fill = "grey90", color = "grey70"), 
+    legend.key = element_rect(fill = "grey95"),                   
+    legend.position = "top")
+####################################################### Code for Sentiment Analysis and its plot Ends################################
+
+####################################################### Historical data analysis and its plot Starts ################################
+# Historical data 
+stock_data <- read_xlsx("/Users/yashdivaker/Desktop/Project/infosys_price.xlsx")
+
+# Date Standarization 
+stock_data <- stock_data %>%
+  mutate(Date = as.Date(Date, format = "%b %d, %Y"))
+
+# Bi-weekly changes
+stock_data <- stock_data %>%
+  mutate(Two_Week = floor_date(Date, unit = "week") + (week(Date) %% 2) * 7)  # Adjust to create 2-week periods
+
+# Calculation for 2-week-wise average for all numerical columns
+biweekly_avg_data <- stock_data %>%
+  group_by(Two_Week) %>%
+  summarise(
+    Open_avg = mean(Open, na.rm = TRUE),
+    High_avg = mean(High, na.rm = TRUE),
+    Low_avg = mean(Low, na.rm = TRUE),
+    Close_avg = mean(Close, na.rm = TRUE)
+  )
+
+# 2-week-wise average data
+print(biweekly_avg_data)
+
+# ggplot with 2-week-wise clarity
+ggplot(biweekly_avg_data, aes(x = Two_Week, y = Open_avg)) +
+  geom_line(color = "steelblue", size = 1.5) +    
+  geom_point(size = 3, color = "darkorange", shape = 21, fill = "white", stroke = 1.2) +  
+  labs(title = "Biweekly Average of Open Price",  
+       x = "2-Week Period",                      
+       y = "Average Open Price (Rs)") +         
+  scale_x_date(date_labels = "%b %d, %Y", date_breaks = "2 weeks") +  
+  theme_minimal(base_size = 14) +                 
+  theme(
+    plot.background = element_rect(fill = "grey98", color = NA),  
+    panel.grid.major = element_line(color = "grey85"),            
+    panel.grid.minor = element_blank(),                           
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black", size = 10), 
+    axis.text.y = element_text(color = "black", size = 10),       
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, color = "darkblue"),  
+    plot.subtitle = element_text(hjust = 0.5, size = 12, color = "darkgrey"),  
+    axis.title.x = element_text(margin = margin(t = 10)),         
+    axis.title.y = element_text(margin = margin(r = 10)),         
+    panel.background = element_rect(fill = "white", color = NA))
+
+####################################################### Historical data analysis and its plot Ends ################################
+####################################################### Infosys Analysis Ends #####################################################
+
+################################################### source_news_comparision data starts ###########################################
+# Source comparision data
+news <- read_xlsx("/Users/yashdivaker/Desktop/Project/news_source_comparision.xlsx")
+
+# Creating the df from the above data
+data <- data.frame(
+  Stock_Name = c('Tech Mahindra', 'Tech Mahindra', 'Tech Mahindra', 'Tech Mahindra', 'Tech Mahindra', 'Tech Mahindra', 
+                 'Infosys', 'Infosys', 'Infosys', 'Infosys', 'Infosys', 'Infosys'),
+  Two_Week = c('07/01/24', '21/01/24', '04/02/24', '18/02/24', '03/03/24', '17/03/24', 
+               '07/01/24', '21/01/24', '04/02/24', '18/02/24', '03/03/24', '17/03/24'),
+  News_Source = c('Economic Times', 'Economic Times', 'Economic Times', 'Economic Times', 'EquityPandit', 'Angel One', 
+                  'Business Today', 'Economic Times', 'Infosys' , 'Infosys','Angel One', 'Equity Pandit'),
+  Source_Avg_Sentiment = c(0.29, 0.29, 0.51, 0.72, 0.26, 1.57, 
+                           1.75, 0.96, 2.10, 1.55, 0.97, 0.23)
+)
+
+# Reshaping the data for better plotting
+data$Stock_Name <- factor(data$Stock_Name, levels = c('Tech Mahindra', 'Infosys'))
+data$Two_Week <- factor(data$Two_Week, levels = unique(data$Two_Week))
+
+# ggplot
+ggplot(data, aes(x = Two_Week, y = Source_Avg_Sentiment, fill = Stock_Name)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7, color = "black") +  
+  geom_text(aes(label = News_Source), 
+            position = position_dodge(width = 0.8), vjust = -0.5, size = 3.5, color = "black") +  
+  labs(x = "Bi-Weekly Period", 
+       y = "Average Sentiment Score", 
+       title = "Comparison of Average Sentiment Scores for Tech Mahindra and Infosys",
+       subtitle = "Bi-weekly sentiment analysis from various news sources") +  
+  scale_fill_manual(values = c("Tech Mahindra" = "blue", "Infosys" = "red"), name = "Stock Name") + 
+  theme_minimal(base_size = 15) +  
+  theme(
+    legend.position = "bottom", 
+    legend.title = element_text(face = "bold"),  
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),  
+    axis.text.y = element_text(color = "black"),  # Black y-axis labels
+    plot.title = element_text(hjust = 0.5, size = 18, face = "bold", color = "darkblue"),
+    plot.subtitle = element_text(hjust = 0.5, size = 12, color = "darkgrey"), 
+    plot.background = element_rect(fill = "grey98"),  
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank())
+################################################### source_news_comparision data ends #############################################
+
+####################################################### Validation and Testing Starts##############################################
+
+# bi-weekly sentiment for both stocks
+biweekly_analysis <- biweekly_sentiment %>%
+  left_join(biweekly_tfidf, by = "Two_Week") %>%
+  left_join(best_news_source, by = "Two_Week")
+
+# Merge sentiment analysis and stock data based on Two_Week for both stocks
+merged_data <- biweekly_analysis %>%
+  inner_join(biweekly_avg_data, by = "Two_Week")
+
+#  Pearson correlation between sentiment score and stock prices for both stocks
+correlation_open <- cor(merged_data$avg_sentiment_score, merged_data$Open_avg, method = "pearson")
+correlation_close <- cor(merged_data$avg_sentiment_score, merged_data$Close_avg, method = "pearson")
+
+# Spliting data into training and testing sets for both stocks
+set.seed(123)
+split <- sample.split(merged_data$avg_sentiment_score, SplitRatio = 0.8)
+train_data <- subset(merged_data, split == TRUE)
+test_data <- subset(merged_data, split == FALSE)
+
+# Correlation testing on train and test sets
+cor_train_open <- cor(train_data$avg_sentiment_score, train_data$Open_avg, method = "pearson")
+cor_train_close <- cor(train_data$avg_sentiment_score, train_data$Close_avg, method = "pearson")
+
+cor_test_open <- cor(test_data$avg_sentiment_score, test_data$Open_avg, method = "pearson")
+cor_test_close <- cor(test_data$avg_sentiment_score, test_data$Close_avg, method = "pearson")
+
+# Plot for sentiment score vs Open price
+ggplot(merged_data, aes(x = avg_sentiment_score, y = Open_avg)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Correlation between Sentiment Score and Open Price", x = "Average Sentiment Score", y = "Average Open Price") +
+  theme_minimal()
+
+# Plot for sentiment score vs Close price
+ggplot(merged_data, aes(x = avg_sentiment_score, y = Close_avg)) +
+  geom_point(color = "green") +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(title = "Correlation between Sentiment Score and Close Price", x = "Average Sentiment Score", y = "Average Close Price") +
+  theme_minimal()
+
+# linear regression for open Price for both stocks
+linear_model_close <- lm(open_avg ~ avg_sentiment_score, data = merged_data)
+
+# correlation between sentiment scores and opne Price for both stocks
+correlation_close <- cor(merged_data$avg_sentiment_score, merged_data$open_avg)
+
+
+
+
+
+####################################################### Validation and Testing Ends####################################################
